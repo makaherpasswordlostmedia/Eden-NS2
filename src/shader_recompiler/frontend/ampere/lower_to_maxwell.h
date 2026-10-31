@@ -21,7 +21,8 @@ namespace Shader::Ampere {
 
 // EDEN_NATIVE_LOWER_DISABLE=<group>[,<group>...] switches individual lowering fixes back to the
 // previous behaviour (rejecting or ignoring the form) so a visual regression can be bisected.
-// Groups: audit_fsel, audit_f2i, cube3d_lod, array2d_bias, byte_sel306. Unset leaves behaviour unchanged.
+// Groups: audit_fsel, audit_f2i, cube3d_lod, array2d_bias, byte_sel306, warpsync_nop. Unset leaves
+// behaviour unchanged.
 inline bool LowerGroupDisabled(std::string_view group) {
     static const std::string list = [] {
         const char* value = std::getenv("EDEN_NATIVE_LOWER_DISABLE");
@@ -602,6 +603,23 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             emit(0x5d20000000000000ULL | predicate | (u64{insn.Bits(81, 3)} << 3) |
                  insn.Bits(84, 3) | (u64{a.reg} << 8) | (u64{b.reg} << 20) |
                  (u64{14} << 35) | (u64{7} << 39) | (u64{a.swizzle} << 47));
+            break;
+        }
+        case 0x234: { // HSETP2, packed half comparison of two registers into two predicates.
+            // Laid out like HSET2 (compare 76-79, combine 69-70, .H_AND 71, FTZ 80, Pc 87-90) with
+            // predicate outputs in 81-83 and 84-86 (as 0x434). Donkey Kong Bananza's compute shaders
+            // in some levels use it; rejecting them left the screen blue.
+            const u32 combine = insn.Bits(69, 2);
+            if (insn.Bits(16, 8) || insn.Bits(64, 5) || combine > 2 || insn.Bits(91, 1) ||
+                (insn.words[1] & 0x0fffff00U))
+                return fail(index, "native packed half predicate mode");
+            const auto a = half_source(0), b = half_source(1);
+            emit(0x5d20000000000000ULL | predicate | (u64{insn.Bits(81, 3)} << 3) | insn.Bits(84, 3) |
+                 (u64{insn.Bits(80, 1)} << 6) | (u64{a.reg} << 8) | (u64{b.reg} << 20) |
+                 (u64{b.swizzle} << 28) | (u64{b.absolute} << 30) | (u64{b.negate} << 31) |
+                 (u64{insn.Bits(76, 4)} << 35) | (u64{insn.Bits(87, 4)} << 39) |
+                 (u64{a.negate} << 43) | (u64{a.absolute} << 44) | (u64{combine} << 45) |
+                 (u64{a.swizzle} << 47) | (u64{insn.Bits(71, 1)} << 49));
             break;
         }
         case 0x233: case 0x433: case 0x633: { // HSET2, packed half comparisons and predicate combination.
@@ -2929,9 +2947,11 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
         case 0x306: case 0xd06: { // I2F.F32 from the low 8/16/32 bits of a register, sign at bit 74
             // Source size (bits 84-85), signedness (74) and rounding (78-79) use the same value
             // order as the Maxwell I2F fields; only the F32 destination (75-76 == 2) is accepted.
-            // Bits 60-61 select the source byte or half-word (Maxwell I2F bits 41-42); 0xd06 reads
-            // a uniform register.
+            // Bits 60-61 select the source byte or, for 16-bit sources, the half-word; Maxwell's
+            // I2F selector (bits 41-42) counts bytes, so the high half is byte 2 (passed as 1, the
+            // translator rejected MKW's character material programs). 0xd06 reads a uniform register.
             const u32 size = insn.Bits(84, 2), selector = insn.Bits(60, 2);
+            const u32 byte_selector = size == 1 ? selector * 2 : selector;
             const u32 i2f_source = opcode == 0xd06 ? uniform_register(insn.Bits(32, 8)) : insn.Bits(32, 8);
             if ((insn.words[2] & ~(0x0030c400U | (opcode == 0xd06 ? 0x08000000U : 0U))) != 0x1000 ||
                 (insn.words[1] & ~0x300000ffU) || i2f_source == ~0U ||
@@ -2940,7 +2960,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                 return fail(index, "native byte-to-float conversion mode");
             emit(base(0x5cb8000000000000ULL) | (u64{2} << 8) | (u64{size} << 10) |
                  (u64{insn.Bits(74, 1)} << 13) | (u64{insn.Bits(78, 2)} << 39) |
-                 (u64{selector} << 41) | (u64{i2f_source} << 20));
+                 (u64{byte_selector} << 41) | (u64{i2f_source} << 20));
             break;
         }
         case 0x245: case 0xa45: case 0xc45: { // I2FP.F32.U32
@@ -3653,7 +3673,15 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                 last_outer_sync_target != s64{index} * 16) {
                 // A full-mask WARPSYNC outside every reconvergence scope that no
                 // branch or call reaches has nothing to join; lanes are emulated together.
+                // Inside a scope or at a loop head (MKW's character face programs) it is
+                // likewise only a convergence hint for Eden, which runs the lanes as written:
+                // rejected, the program's draws were dropped (half-closed eyelids, darker
+                // characters). EDEN_NATIVE_LOWER_DISABLE=warpsync_nop rejects it there again.
                 bool reached = full_mask_sync ? !barrier_tokens.empty() : true;
+                if (full_mask_sync && !LowerGroupDisabled("warpsync_nop")) {
+                    emit(0x50b0000000000f00ULL | predicate);
+                    break;
+                }
                 for (u32 previous = 0; !reached && previous < code.size(); ++previous) {
                     const auto& branch = code[previous];
                     const u32 op = branch.Bits(0, 12);
